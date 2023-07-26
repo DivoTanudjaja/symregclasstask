@@ -27,7 +27,16 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+import pandas as pd
+from torchvision.io import read_image
+from torch.utils.data import Dataset, DataLoader
+import ast
+from sympy import sympify, symbols, lambdify
+
 from model import GPTConfig, GPT
+
+import warnings
+warnings.filterwarnings("ignore")
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -112,44 +121,87 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # poor man's data loader
-data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+# data_dir = os.path.join('data', dataset)
+# train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+# val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+# def get_batch(split):
+#     data = train_data if split == 'train' else val_data
+#     ix = torch.randint(len(data) - block_size, (batch_size,))
+#     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+#     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+#     if device_type == 'cuda':
+#         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+#         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+#     else:
+#         x, y = x.to(device), y.to(device)
+#     return x, y
+
+class CustomEquationDataset(Dataset):
+    def __init__(self, equation_file, transform=None, target_transform=None):
+        self.eq_labels = pd.read_csv(equation_file)
+        self.transform = transform
+        self.target_transform = target_transform
+
+    def __len__(self):
+        return len(self.eq_labels)
+
+    def __getitem__(self, idx):
+        equation = self.eq_labels.iloc[idx, 1]
+        support = self.eq_labels.iloc[idx, 2]
+        support = ast.literal_eval(support)
+        length = len(support)
+
+        x_1, x_2, x_3 = symbols('x_1 x_2 x_3')
+        sympified_eq = sympify(str(equation))
+        eq_lambda = lambdify((x_1, x_2, x_3), sympified_eq, modules=['numpy'])
+
+        params = np.zeros((4, 100)).astype(float)
+
+        a = np.random.uniform(-10, 10, (length, 100)).astype(float)
+        params[:length] = a
+
+        last_row = eq_lambda(params[0], params[1], params[2])
+        params[3] = last_row
+
+        while not np.all(np.isreal(params[3])):
+            a = np.random.uniform(-25, 25, (length, 100)).astype(float)
+            params[:length] = a
+            last_row = eq_lambda(params[0], params[1], params[2])
+            params[:, ~np.isreal(params[3])] = last_row[:, ~np.isreal(params[3])]
+
+        last_row = eq_lambda(params[0], params[1], params[2])
+        params[3] = last_row
+        
+        bases = self.eq_labels.iloc[idx, 4]
+        # convert bases into a list of integers
+        bases = [int(i) for i in bases[1:-1].split(',')]
+
+        if self.transform:
+            params = self.transform(params)
+
+        if self.target_transform:
+            bases = self.target_transform(bases)
+        
+        return torch.tensor(params, dtype=torch.float16), torch.tensor(bases, dtype=torch.float16).long()
+
+
+train_dataset = CustomEquationDataset(equation_file='data/nesymres/train_nc.csv')
+val_dataset = CustomEquationDataset(equation_file='data/nesymres/val_nc.csv')
+
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
-# attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=14, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -213,14 +265,19 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+    with torch.no_grad():
+        for split, dataloader in [('train', train_dataloader), ('val', val_dataloader)]:
+            losses = torch.zeros(eval_iters)
+            for k in range(eval_iters):
+                X, Y = next(iter(dataloader))
+                # X = torch.randn((batch_size, 4, 100))
+                # Y = torch.randn((batch_size, 14))
+                X = X.to(device, dtype=torch.float16)
+                Y = Y.to(device, dtype=torch.float16)
+                with ctx:
+                    logits, loss = model(X, Y)
+                losses[k] = loss.item()
+            out[split] = losses.mean()
     model.train()
     return out
 
@@ -243,10 +300,17 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+train_iter = iter(train_dataloader)
+X, Y = next(train_iter) # fetch the very first batch
+# X = torch.randn((batch_size, 4, 100))
+# Y = torch.randn((batch_size, 15))
+X = X.to(device, dtype=torch.float16)
+Y = Y.to(device, dtype=torch.float16)
+
 t0 = time.time()
-local_iter_num = 0 # number of iterations in the lifetime of this process
+local_iter_num = 0 # number of iterations in the lifetime of  this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
@@ -294,10 +358,16 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
+            X = X.to(device, dtype=torch.float16)
+            Y = Y.to(device, dtype=torch.float16)
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y = next(train_iter)
+        # X = torch.randn((batch_size, 4, 100))
+        # Y = torch.randn((batch_size,14))
+        X = X.to(device, dtype=torch.float16)
+        Y = Y.to(device, dtype=torch.float16)
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
