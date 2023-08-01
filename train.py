@@ -30,7 +30,7 @@ model = torch.compile(model)
 
 # Hyperparameters
 batch_size = 512
-epochs = 25
+epochs = 2
 
 # DataLoaders
 train_dataloader = DataLoader(PrecomputedDataset('data/nesymres/train_nc.pt'), batch_size, shuffle=True, drop_last=True)
@@ -141,27 +141,26 @@ def test_loop(dataloader, model):
             correct_less_strict += (pred == y).sum(dim=1).type(torch.float16).sum().item()
 
     test_loss /= num_batches
-    print(correct)
-    print(correct_less_strict)
     correct /= size
     partial_correct = correct_less_strict / size
+    partial_correct /= 14
     print("----")
-    print(correct)
-    print(partial_correct)
-    avg_accuracies = [index_accuracies[i] / size for i in range(len(index_accuracies))]
+    print(size)
+    print("----")
+    avg_accuracies = [index_accuracies[i] * 100 / size for i in range(len(index_accuracies))]
 
     if dataloader == train_dataloader:
         print(f"Train Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
         train_complete_accuracy_list.append(100*correct)
         train_loss_list.append(test_loss)
         train_partial_accuracy_list.append(partial_correct*100)
-        train_avg_accuracy_list.append(element*100 for element in avg_accuracies)
+        train_avg_accuracy_list.append(avg_accuracies)
     else:
         print(f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n")
         test_complete_accuracy_list.append(100*correct)
         test_loss_list.append(test_loss)
         test_partial_accuracy_list.append(partial_correct*100)
-        test_avg_accuracy_list.append(element*100 for element in avg_accuracies)
+        test_avg_accuracy_list.append(avg_accuracies)
 
 if __name__ == '__main__':
     print(f"Epoch 0\n-------------------------------")
