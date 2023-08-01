@@ -27,7 +27,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
 class CausalSelfAttention(nn.Module):
-
+    # modified to a simple SelfAttention | we need to remove the mask
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -61,7 +61,7 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=False)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -121,6 +121,7 @@ class GPT(nn.Module):
         super().__init__()
         assert config.block_size is not None
         self.config = config
+        self.device = torch.device("cpu")
 
         self.transformer = nn.ModuleDict(dict(
             embedding = nn.Linear(4, config.n_embd, bias=False),
@@ -166,7 +167,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None):
         # swap the last two dimensions of idx
-        idx = idx.transpose(-1, -2)
+        idx = idx.transpose(-1, -2)  # bsz, T, 4 
         device = idx.device
         b, t, _ = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
